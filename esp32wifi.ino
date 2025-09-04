@@ -1,38 +1,52 @@
 #include "esp_camera.h"
 #include <WiFi.h>
-#include <ESP32Servo.h>
-#include "tflite-micro/tensorflow/lite/micro/all_ops_resolver.h"
-#include "tflite-micro/tensorflow/lite/micro/micro_error_reporter.h"
-#include "tflite-micro/tensorflow/lite/micro/micro_interpreter.h"
-#include "tflite-micro/tensorflow/lite/schema/schema_generated.h"
-#include "model.h" // TFLite model as C array
 
-#define CAMERA_MODEL_AI_THINKER
+//
+// WARNING!!! PSRAM IC required for UXGA resolution and high JPEG quality
+//            Ensure ESP32 Wrover Module or other board with PSRAM is selected
+//            Partial images will be transmitted if image exceeds buffer size
+//
+//            You must select partition scheme from the board menu that has at least 3MB APP space.
+//            Face Recognition is DISABLED for ESP32 and ESP32-S2, because it takes up from 15
+//            seconds to process single frame. Face Detection is ENABLED if PSRAM is enabled as well
+
+// ===================
+// Select camera model
+// ===================
+//#define CAMERA_MODEL_WROVER_KIT // Has PSRAM
+//#define CAMERA_MODEL_ESP_EYE  // Has PSRAM
+//#define CAMERA_MODEL_ESP32S3_EYE // Has PSRAM
+//#define CAMERA_MODEL_M5STACK_PSRAM // Has PSRAM
+//#define CAMERA_MODEL_M5STACK_V2_PSRAM // M5Camera version B Has PSRAM
+//#define CAMERA_MODEL_M5STACK_WIDE // Has PSRAM
+//#define CAMERA_MODEL_M5STACK_ESP32CAM // No PSRAM
+//#define CAMERA_MODEL_M5STACK_UNITCAM // No PSRAM
+//#define CAMERA_MODEL_M5STACK_CAMS3_UNIT  // Has PSRAM
+#define CAMERA_MODEL_AI_THINKER // Has PSRAM
+//#define CAMERA_MODEL_TTGO_T_JOURNAL // No PSRAM
+//#define CAMERA_MODEL_XIAO_ESP32S3 // Has PSRAM
+// ** Espressif Internal Boards **
+//#define CAMERA_MODEL_ESP32_CAM_BOARD
+//#define CAMERA_MODEL_ESP32S2_CAM_BOARD
+//#define CAMERA_MODEL_ESP32S3_CAM_LCD
+//#define CAMERA_MODEL_DFRobot_FireBeetle2_ESP32S3 // Has PSRAM
+//#define CAMERA_MODEL_DFRobot_Romeo_ESP32S3 // Has PSRAM
 #include "camera_pins.h"
 
-// WiFi credentials (optional)
-const char *ssid = "Galaxy S20 FE 5G E388";
-const char *password = "yasl8311";
+// ===========================
+// Enter your WiFi credentials
+// ===========================
+const char *ssid = "**********";
+const char *password = "**********";
 
-// Servo configuration
-Servo myservo;
-int servoPin = 15; // GPIO15 for servo signal
-
-// TFLite globals
-tflite::MicroErrorReporter micro_error_reporter;
-tflite::ErrorReporter *error_reporter = &micro_error_reporter;
-const tflite::Model *model = nullptr;
-tflite::MicroInterpreter *interpreter = nullptr;
-TfLiteTensor *input = nullptr;
-TfLiteTensor *output = nullptr;
-constexpr int kTensorArenaSize = 300 * 1024;
-uint8_t tensor_arena[kTensorArenaSize];
+void startCameraServer();
+void setupLedFlash(int pin);
 
 void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
+  Serial.println();
 
-  // Camera configuration
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -53,123 +67,91 @@ void setup() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_QVGA;
-  config.pixel_format = PIXFORMAT_RGB565;
-  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.frame_size = FRAMESIZE_UXGA;
+  config.pixel_format = PIXFORMAT_JPEG;  // for streaming
+  config.pixel_format = PIXFORMAT_RGB565; // for face detection/recognition
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 10;
-  config.fb_count = 2;
+  config.jpeg_quality = 12;
+  config.fb_count = 1;
 
-  if (psramFound()) {
-    config.frame_size = FRAMESIZE_QVGA;
-    config.fb_count = 2;
+  // if PSRAM IC present, init with UXGA resolution and higher JPEG quality
+  //                      for larger pre-allocated frame buffer.
+  if (config.pixel_format == PIXFORMAT_JPEG) {
+    if (psramFound()) {
+      config.jpeg_quality = 10;
+      config.fb_count = 2;
+      config.grab_mode = CAMERA_GRAB_LATEST;
+    } else {
+      // Limit the frame size when PSRAM is not available
+      config.frame_size = FRAMESIZE_SVGA;
+      config.fb_location = CAMERA_FB_IN_DRAM;
+    }
   } else {
-    config.frame_size = FRAMESIZE_CIF;
-    config.fb_location = CAMERA_FB_IN_DRAM;
+    // Best option for face detection/recognition
+    config.frame_size = FRAMESIZE_240X240;
+#if CONFIG_IDF_TARGET_ESP32S3
+    config.fb_count = 2;
+#endif
   }
 
+#if defined(CAMERA_MODEL_ESP_EYE)
+  pinMode(13, INPUT_PULLUP);
+  pinMode(14, INPUT_PULLUP);
+#endif
+
+  // camera init
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x", err);
     return;
   }
 
-  // Servo setup
-  ESP32PWM::allocateTimer(0);
-  ESP32PWM::allocateTimer(1);
-  myservo.setPeriodHertz(50);
-  myservo.attach(servoPin, 500, 2400);
-  myservo.write(0);
+  sensor_t *s = esp_camera_sensor_get();
+  // initial sensors are flipped vertically and colors are a bit saturated
+  if (s->id.PID == OV3660_PID) {
+    s->set_vflip(s, 1);        // flip it back
+    s->set_brightness(s, 1);   // up the brightness just a bit
+    s->set_saturation(s, -2);  // lower the saturation
+  }
+  // drop down frame size for higher initial frame rate
+  if (config.pixel_format == PIXFORMAT_JPEG) {
+    s->set_framesize(s, FRAMESIZE_QVGA);
+  }
 
-  // WiFi connection (optional)
+#if defined(CAMERA_MODEL_M5STACK_WIDE) || defined(CAMERA_MODEL_M5STACK_ESP32CAM)
+  s->set_vflip(s, 1);
+  s->set_hmirror(s, 1);
+#endif
+
+#if defined(CAMERA_MODEL_ESP32S3_EYE)
+  s->set_vflip(s, 1);
+#endif
+
+// Setup LED FLash if LED pin is defined in camera_pins.h
+#if defined(LED_GPIO_NUM)
+  setupLedFlash(LED_GPIO_NUM);
+#endif
+
   WiFi.begin(ssid, password);
+  WiFi.setSleep(false);
+
+  Serial.print("WiFi connecting");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
+  Serial.println("");
   Serial.println("WiFi connected");
 
-  // Initialize TFLite
-  model = tflite::GetModel(g_model);
-  if (model->version() != TFLITE_SCHEMA_VERSION) {
-    Serial.println("Model schema version mismatch");
-    return;
-  }
+  startCameraServer();
 
-  static tflite::AllOpsResolver resolver;
-  static tflite::MicroInterpreter static_interpreter(model, resolver, tensor_arena, kTensorArenaSize, error_reporter);
-  interpreter = &static_interpreter;
-
-  TfLiteStatus allocate_status = interpreter->AllocateTensors();
-  if (allocate_status != kTfLiteOk) {
-    Serial.println("AllocateTensors failed");
-    return;
-  }
-
-  input = interpreter->input(0);
-  output = interpreter->output(0);
-
-  Serial.printf("Input tensor shape: [%d,%d,%d,%d]\n",
-                input->dims->data[0], input->dims->data[1],
-                input->dims->data[2], input->dims->data[3]);
-  Serial.printf("Output tensor shape: [%d,%d]\n",
-                output->dims->data[0], output->dims->data[1]);
+  Serial.print("Camera Ready! Use 'http://");
+  Serial.print(WiFi.localIP());
+  Serial.println("' to connect");
 }
 
 void loop() {
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) {
-    Serial.println("Camera capture failed");
-    return;
-  }
-
-  preprocessImage(fb);
-
-  if (interpreter->Invoke() != kTfLiteOk) {
-    Serial.println("Inference failed");
-    return;
-  }
-
-  float *output_data = output->data.f;
-  int max_index = 0;
-  float max_value = output_data[0];
-  for (int i = 1; i < output->dims->data[1]; i++) {
-    if (output_data[i] > max_value) {
-      max_value = output_data[i];
-      max_index = i;
-    }
-  }
-
-  if (max_index == 0) {
-    myservo.write(0);
-    Serial.println("Detected: Organic, Servo to 0°");
-  } else {
-    myservo.write(90);
-    Serial.println("Detected: Recyclable, Servo to 90°");
-  }
-
-  esp_camera_fb_return(fb);
-  delay(500);
-}
-
-void preprocessImage(camera_fb_t *fb) {
-  uint8_t *rgb888 = (uint8_t *)malloc(224 * 224 * 3);
-  if (!rgb888) {
-    Serial.println("Memory allocation failed");
-    return;
-  }
-
-  int k = 0;
-  for (int i = 0; i < fb->len; i += 2) {
-    uint16_t rgb565 = (fb->buf[i] << 8) | fb->buf[i + 1];
-    rgb888[k++] = (rgb565 >> 11) * 255 / 31; // Red
-    rgb888[k++] = ((rgb565 >> 5) & 0x3F) * 255 / 63; // Green
-    rgb888[k++] = (rgb565 & 0x1F) * 255 / 31; // Blue
-  }
-
-  for (int i = 0; i < 224 * 224 * 3; i++) {
-    input->data.f[i] = rgb888[i] / 255.0f; // Normalize
-  }
-
-  free(rgb888);
+  // Do nothing. Everything is done in another task by the web server
+  delay(10000);
 }
